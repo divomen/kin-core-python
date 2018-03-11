@@ -27,8 +27,13 @@ class AccountData(PModel):
         high_threshold = IntType(default=0)
 
     class Flags(PModel):
-        auth_required = BooleanType(default=False)
-        auth_revocable = BooleanType(default=False)
+        """Flags set on issuer accounts.
+           TrustLines are created with authorized set to "false" requiring
+           the issuer to set it for each TrustLine
+        """
+        auth_required = BooleanType(default=False)  # If set, the authorized flag in TrustLines can be cleared.
+        # Otherwise, authorization cannot be revoked
+        auth_revocable = BooleanType(default=False)  # Once set, causes all AUTH_* flags to be read-only
 
     class Balance(PModel):
         asset_type = StringType()
@@ -91,19 +96,19 @@ class TransactionResultCodes(PModel):
     operations = ListType(StringType, default=[])
 
 
-class FailedTransactionExtras(PModel):
-    envelope_xdr = StringType()
-    result_xdr = StringType()
-    result_codes = ModelType(TransactionResultCodes)
-
-
 class HTTPProblemDetails(PModel):
     """HTTP Problem Details object.
     See https://tools.ietf.org/html/rfc7807
     """
+    class Extras(PModel):
+        invalid_field = StringType()
+        envelope_xdr = StringType()
+        result_xdr = StringType()
+        result_codes = ModelType(TransactionResultCodes)
+
     type = StringType()
     title = StringType()
     status = IntType()
     detail = StringType()
     instance = StringType()
-    extras = ModelType(FailedTransactionExtras)
+    extras = ModelType(Extras)
