@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*
 
 # Copyright (C) 2018 Kin Foundation
-
+import json
 from decimal import Decimal, getcontext
 from functools import partial
 
@@ -385,6 +385,9 @@ class SDK(object):
         """
         self._monitor_accounts_transactions(self.kin_asset, addresses, callback_fn, only_payments=True)
 
+    def monitor_accounts_kin_payments_gen(self, addresses, cursor='now'):
+        return self._monitor_accounts_gen(self.kin_asset, addresses, only_payments=True, cursor=cursor)
+
     # noinspection PyTypeChecker
     def monitor_accounts_transactions(self, addresses, callback_fn):
         """Monitor transactions related to the account identified by a provided addresses (all transaction types).
@@ -400,6 +403,9 @@ class SDK(object):
         :raises: :class:`~kin.AccountNotFoundError`: if one of the provided accounts is not yet created.
         """
         self._monitor_accounts_transactions(None, addresses, callback_fn)
+
+    def monitor_accounts_gen(self, addresses, cursor='now'):
+        return self._monitor_accounts_gen(None, addresses, cursor)
 
     # Helpers
 
@@ -529,6 +535,16 @@ class SDK(object):
             raise translate_error(e)
 
     def _monitor_accounts_transactions(self, asset, addresses, callback_fn, only_payments=False):
+        def event_processor():
+            for address, tx_data in self._monitor_accounts_gen(asset, addresses, only_payments):
+                callback_fn(address, tx_data)
+        # start monitoring thread
+        import threading
+        t = threading.Thread(target=event_processor)
+        t.daemon = True
+        t.start()
+
+    def _monitor_accounts_gen(self, asset, addresses, only_payments=False, cursor='now'):
         """Monitor transactions related to the accounts identified by provided addresses. If asset is given, only
         the transactions for this asset will be returned.
         NOTE: the functions starts a background thread.
@@ -562,64 +578,41 @@ class SDK(object):
             if not self.check_account_exists(address):
                 raise AccountNotFoundError(addresses)
 
-        # determine the last_id to start from
-        last_id = None
-        if len(addresses) == 1:
-            reply = self.horizon.account_transactions(addresses[0], params={'order': 'desc', 'limit': 2})
-        else:
-            reply = self.horizon.transactions(params={'order': 'desc', 'limit': 2})
-        if len(reply['_embedded']['records']) == 2:
-            tt = reply['_embedded']['records'][1]
-            last_id = TransactionData(tt, strict=False).paging_token
-
-        # start monitoring transactions from last_id. TODO: use cursor=now instead
         # make the SSE request synchronous (will raise errors in the current thread)
         if len(addresses) == 1:
-            events = self.horizon.account_transactions(addresses[0], sse=True, params={'last_id': last_id})
+            events = self.horizon.account_transactions(addresses[0], sse=True, params={'cursor': cursor})
         else:
-            events = self.horizon.transactions(sse=True, params={'last_id': last_id})
+            events = self.horizon.transactions(sse=True, params={'cursor': cursor})
 
         # asynchronous event processor
-        def event_processor():
-            import json
-            for event in events:
-                if event.event != 'message':
-                    continue
-                try:
-                    tx = json.loads(event.data)
+        for event in events:
+            if event.event != 'message':
+                continue
+            try:
+                tx = json.loads(event.data)
 
-                    # get transaction operations
-                    tx_ops = self.horizon.transaction_operations(tx['hash'], params={'limit': 100})
-                    tx['operations'] = tx_ops['_embedded']['records']
+                # get transaction operations
+                tx_ops = self.horizon.transaction_operations(tx['hash'], params={'limit': 100})
+                tx['operations'] = tx_ops['_embedded']['records']
 
-                    # deserialize
-                    tx_data = TransactionData(tx, strict=False)
-
-                    # iterate over transaction operations and see if there's a match
-                    for op_data in tx_data.operations:
-                        if only_payments and op_data.type != 'payment':
+                # deserialize
+                tx_data = TransactionData(tx, strict=False)
+                # iterate over transaction operations and see if there's a match
+                for op_data in tx_data.operations:
+                    if only_payments and op_data.type != 'payment':
+                        continue
+                    if asset:
+                        if op_data.asset_type == 'native' and not asset.is_native():
                             continue
-                        if asset:
-                            if op_data.asset_type == 'native' and not asset.is_native():
-                                continue
-                            if op_data.asset_code != asset.code or op_data.asset_issuer != asset.issuer:
-                                continue
-                        if len(addresses) == 1:
-                            callback_fn(addresses[0], tx_data)
-                            break
-                        elif op_data.from_address in addresses:
-                            callback_fn(op_data.from_address, tx_data)
-                            break
-                        elif op_data.to_address in addresses:
-                            callback_fn(op_data.to_address, tx_data)
-                            break
+                        if op_data.asset_code != asset.code or op_data.asset_issuer != asset.issuer:
+                            continue
+                    if op_data.from_address in addresses:
+                        yield op_data.from_address, tx_data
+                        break
+                    elif op_data.to_address in addresses:
+                        yield op_data.to_address, tx_data
+                        break
 
-                except Exception as ex:
-                    logger.exception(ex)
-                    continue
-
-        # start monitoring thread
-        import threading
-        t = threading.Thread(target=event_processor)
-        t.daemon = True
-        t.start()
+            except Exception as ex:
+                logger.exception(ex)
+                continue
