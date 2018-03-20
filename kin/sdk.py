@@ -538,6 +538,7 @@ class SDK(object):
         def event_processor():
             for address, tx_data in self._monitor_accounts_gen(asset, addresses, only_payments):
                 callback_fn(address, tx_data)
+
         # start monitoring thread
         import threading
         t = threading.Thread(target=event_processor)
@@ -554,10 +555,11 @@ class SDK(object):
 
         :param: str addresses: the addresses of the accounts to query.
 
-        :param callback_fn: the function to call on each received transaction as `callback_fn(address, tx_data)`.
+        :param: callback_fn: the function to call on each received transaction as `callback_fn(address, tx_data)`.
         :type: callable[[str, :class:`~kin.TransactionData`], None]
 
-        :param boolean only_payments: whether to return payment transactions only.
+        :param: boolean only_payments: whether to return payment transactions only.
+        :param: str cursor: where to start yielding transactions from (default=now)
 
         :raises: ValueError: if asset issuer is invalid.
         :raises: ValueError: when no addresses are given.
@@ -578,41 +580,49 @@ class SDK(object):
             if not self.check_account_exists(address):
                 raise AccountNotFoundError(addresses)
 
-        # make the SSE request synchronous (will raise errors in the current thread)
-        if len(addresses) == 1:
-            events = self.horizon.account_transactions(addresses[0], sse=True, params={'cursor': cursor})
-        else:
-            events = self.horizon.transactions(sse=True, params={'cursor': cursor})
-
-        # asynchronous event processor
-        for event in events:
-            if event.event != 'message':
-                continue
+        while True:
             try:
-                tx = json.loads(event.data)
-
-                # get transaction operations
-                tx_ops = self.horizon.transaction_operations(tx['hash'], params={'limit': 100})
-                tx['operations'] = tx_ops['_embedded']['records']
-
-                # deserialize
-                tx_data = TransactionData(tx, strict=False)
-                # iterate over transaction operations and see if there's a match
-                for op_data in tx_data.operations:
-                    if only_payments and op_data.type != 'payment':
+                if len(addresses) == 1:
+                    events = self.horizon.account_transactions(addresses[0], sse=True, params={'cursor': cursor})
+                else:
+                    events = self.horizon.transactions(sse=True, params={'cursor': cursor})
+                # generator
+                for event in events:
+                    if event.event != 'message':
                         continue
-                    if asset:
-                        if op_data.asset_type == 'native' and not asset.is_native():
-                            continue
-                        if op_data.asset_code != asset.code or op_data.asset_issuer != asset.issuer:
-                            continue
-                    if op_data.from_address in addresses:
-                        yield op_data.from_address, tx_data
-                        break
-                    elif op_data.to_address in addresses:
-                        yield op_data.to_address, tx_data
-                        break
+                    try:
+                        tx = json.loads(event.data)
 
-            except Exception as ex:
-                logger.exception(ex)
-                continue
+                        # get transaction operations
+                        tx_ops = self.horizon.transaction_operations(tx['hash'], params={'limit': 100})
+                        tx['operations'] = tx_ops['_embedded']['records']
+
+                        # deserialize
+                        tx_data = TransactionData(tx, strict=False)
+                        # iterate over transaction operations and see if there's a match
+                        for op_data in tx_data.operations:
+                            if only_payments and op_data.type != 'payment':
+                                continue
+                            if asset:
+                                if op_data.asset_type == 'native' and not asset.is_native():
+                                    continue
+                                if op_data.asset_code != asset.code or op_data.asset_issuer != asset.issuer:
+                                    continue
+                            if op_data.from_address in addresses:
+                                yield op_data.from_address, tx_data
+                                break
+                            elif op_data.to_address in addresses:
+                                yield op_data.to_address, tx_data
+                                break
+
+                        cursor = tx_data.paging_token  # update cursor to latest block
+                    except Exception as ex:
+                        logger.exception(ex)
+                        continue
+
+            except Exception as e:
+                err = translate_error(e)
+                if isinstance(err, NetworkError):
+                    continue  # resumes from the latest cursor
+                else:
+                    raise err
