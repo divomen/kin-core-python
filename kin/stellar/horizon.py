@@ -221,10 +221,7 @@ class Horizon(object):
         if SSEClient is None:
             raise ValueError('SSE not supported, missing sseclient module')
 
-        def build_headers():
-            pass
-
-        return SSEClient(url, session=self._sse_session, params=params, build_headers=build_headers)
+        return SSEClient(url, session=self._sse_session, params=params, build_headers=lambda: {})
 
     @staticmethod
     def testnet():
